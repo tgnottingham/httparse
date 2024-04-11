@@ -547,7 +547,7 @@ impl<'h, 'b> Request<'h, 'b> {
         newline!(bytes);
 
         let len = orig_len - bytes.len();
-        let headers_len = complete!(parse_headers_iter_uninit(
+        let parse_headers_status = parse_headers_iter_uninit(
             &mut headers,
             &mut bytes,
             &HeaderParserConfig {
@@ -556,11 +556,14 @@ impl<'h, 'b> Request<'h, 'b> {
                 allow_space_before_first_header_name: config.allow_space_before_first_header_name,
                 ignore_invalid_headers: config.ignore_invalid_headers_in_requests
             },
-        ));
+        )?;
         /* SAFETY: see `parse_headers_iter_uninit` guarantees */
         self.headers = unsafe { assume_init_slice(headers) };
 
-        Ok(Status::Complete(len + headers_len))
+        match parse_headers_status {
+            Status::Complete(headers_len) => Ok(Status::Complete(len + headers_len)),
+            Status::Partial => Ok(Status::Partial),
+        }
     }
 
     /// Try to parse a buffer of bytes into the Request,
@@ -583,7 +586,7 @@ impl<'h, 'b> Request<'h, 'b> {
             let headers: *mut [Header<'_>] = headers;
             let headers = headers as *mut [MaybeUninit<Header<'_>>];
             match self.parse_with_config_and_uninit_headers(buf, config, &mut *headers) {
-                Ok(Status::Complete(idx)) => Ok(Status::Complete(idx)),
+                Ok(status) => Ok(status),
                 other => {
                     // put the original headers back
                     self.headers = &mut *(headers as *mut [Header<'_>]);
@@ -687,7 +690,7 @@ impl<'h, 'b> Response<'h, 'b> {
             let headers: *mut [Header<'_>] = headers;
             let headers = headers as *mut [MaybeUninit<Header<'_>>];
             match self.parse_with_config_and_uninit_headers(buf, config, &mut *headers) {
-                Ok(Status::Complete(idx)) => Ok(Status::Complete(idx)),
+                Ok(status) => Ok(status),
                 other => {
                     // put the original headers back
                     self.headers = &mut *(headers as *mut [Header<'_>]);
@@ -745,7 +748,7 @@ impl<'h, 'b> Response<'h, 'b> {
 
 
         let len = orig_len - bytes.len();
-        let headers_len = complete!(parse_headers_iter_uninit(
+        let parse_headers_status = parse_headers_iter_uninit(
             &mut headers,
             &mut bytes,
             &HeaderParserConfig {
@@ -754,10 +757,14 @@ impl<'h, 'b> Response<'h, 'b> {
                 allow_space_before_first_header_name: config.allow_space_before_first_header_name,
                 ignore_invalid_headers: config.ignore_invalid_headers_in_responses
             }
-        ));
+        )?;
         /* SAFETY: see `parse_headers_iter_uninit` guarantees */
         self.headers = unsafe { assume_init_slice(headers) };
-        Ok(Status::Complete(len + headers_len))
+
+        match parse_headers_status {
+            Status::Complete(headers_len) => Ok(Status::Complete(len + headers_len)),
+            Status::Partial => Ok(Status::Partial),
+        }
     }
 }
 
@@ -1559,7 +1566,7 @@ mod tests {
             assert_eq!(req.method.unwrap(), "GET");
             assert_eq!(req.path.unwrap(), "/");
             assert_eq!(req.version.unwrap(), 1);
-            assert_eq!(req.headers.len(), NUM_OF_HEADERS); // doesn't slice since not Complete
+            assert_eq!(req.headers.len(), 1);
             assert_eq!(req.headers[0].name, "Host");
             assert_eq!(req.headers[0].value, b"yolo");
         }
@@ -1760,7 +1767,7 @@ mod tests {
             assert_eq!(res.version.unwrap(), 1);
             assert_eq!(res.code.unwrap(), 200);
             assert_eq!(res.reason.unwrap(), "OK");
-            assert_eq!(res.headers.len(), NUM_OF_HEADERS); // doesn't slice since not Complete
+            assert_eq!(res.headers.len(), 1);
             assert_eq!(res.headers[0].name, "Server");
             assert_eq!(res.headers[0].value, b"yolo");
         }
