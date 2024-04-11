@@ -484,7 +484,7 @@ impl ParserConfig {
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```
 /// let buf = b"GET /404 HTTP/1.1\r\nHost:";
 /// let mut headers = [httparse::EMPTY_HEADER; 16];
 /// let mut req = httparse::Request::new(&mut headers);
@@ -768,6 +768,104 @@ impl<'h, 'b> Response<'h, 'b> {
     }
 }
 
+/// A parsed list of header fields.
+///
+/// The list will be populated with the header fields that could be parsed if the parse was not
+/// complete. This allows you to parse headers incrementally, or inspect the parts that could be
+/// parsed, before reading more, in case you wish to exit early.
+///
+/// # Example
+///
+/// ```
+/// let buf = b"Host: foo.bar\nAccept: */*\n";
+/// let mut headers = [httparse::EMPTY_HEADER; 16];
+/// let mut headers = httparse::Headers::new(&mut headers);
+/// let res = headers.parse(buf).unwrap();
+/// if res.is_partial() {
+///     for header in headers.headers {
+///         if header.name.eq_ignore_ascii_case("accept") {
+///             // Check accept header for validity.
+///             // Invalid? We could stop parsing.
+///         }
+///     }
+/// }
+/// ```
+#[derive(Debug, Eq, PartialEq)]
+pub struct Headers<'headers, 'buf> {
+    /// The headers.
+    pub headers: &'headers mut [Header<'buf>]
+}
+
+impl<'h, 'b> Headers<'h, 'b> {
+    /// Creates a new Headers, using a slice of headers you allocate.
+    #[inline]
+    pub fn new(headers: &'h mut [Header<'b>]) -> Headers<'h, 'b> {
+        Headers {
+            headers,
+        }
+    }
+
+    fn parse_with_config_and_uninit_headers(
+        &mut self,
+        buf: &'b [u8],
+        config: &HeaderParserConfig,
+        mut headers: &'h mut [MaybeUninit<Header<'b>>],
+    ) -> Result<usize> {
+        let mut bytes = Bytes::new(buf);
+        let parse_headers_status = parse_headers_iter_uninit(
+            &mut headers,
+            &mut bytes,
+            &HeaderParserConfig {
+                allow_spaces_after_header_name: config.allow_spaces_after_header_name,
+                allow_obsolete_multiline_headers: config.allow_obsolete_multiline_headers,
+                allow_space_before_first_header_name: config.allow_space_before_first_header_name,
+                ignore_invalid_headers: config.ignore_invalid_headers
+            },
+        )?;
+        /* SAFETY: see `parse_headers_iter_uninit` guarantees */
+        self.headers = unsafe { assume_init_slice(headers) };
+
+        Ok(parse_headers_status)
+    }
+
+    /// Try to parse a buffer of bytes into the Headers,
+    /// except use an uninitialized slice of `Header`s.
+    ///
+    /// For more information, see `parse`
+    pub fn parse_with_uninit_headers(
+        &mut self,
+        buf: &'b [u8],
+        headers: &'h mut [MaybeUninit<Header<'b>>],
+    ) -> Result<usize> {
+        self.parse_with_config_and_uninit_headers(buf, &Default::default(), headers)
+    }
+
+    fn parse_with_config(&mut self, buf: &'b [u8], config: &HeaderParserConfig) -> Result<usize> {
+        let headers = core::mem::replace(&mut self.headers, &mut []);
+
+        /* SAFETY: see `parse_headers_iter_uninit` guarantees */
+        unsafe {
+            let headers: *mut [Header<'_>] = headers;
+            let headers = headers as *mut [MaybeUninit<Header<'_>>];
+            match self.parse_with_config_and_uninit_headers(buf, config, &mut *headers) {
+                Ok(status) => Ok(status),
+                other => {
+                    // put the original headers back
+                    self.headers = &mut *(headers as *mut [Header<'_>]);
+                    other
+                },
+            }
+        }
+    }
+
+    /// Try to parse a buffer of bytes into the Headers.
+    ///
+    /// Returns byte offset in `buf` to start of HTTP body.
+    pub fn parse(&mut self, buf: &'b [u8]) -> Result<usize> {
+        self.parse_with_config(buf, &Default::default())
+    }
+}
+
 /// Represents a parsed header.
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct Header<'a> {
@@ -1009,45 +1107,173 @@ fn parse_code(bytes: &mut Bytes<'_>) -> Result<u16> {
 ///            ][..]))));
 /// ```
 pub fn parse_headers<'b: 'h, 'h>(
-    src: &'b [u8],
-    mut dst: &'h mut [Header<'b>],
+    buf: &'b [u8],
+    headers: &'h mut [Header<'b>],
 ) -> Result<(usize, &'h [Header<'b>])> {
-    let mut iter = Bytes::new(src);
-    let pos = complete!(parse_headers_iter(&mut dst, &mut iter, &HeaderParserConfig::default()));
-    Ok(Status::Complete((pos, dst)))
+    let mut headers = Headers::new(headers);
+    match headers.parse(buf)? {
+        Status::Complete(len) => Ok(Status::Complete((len, headers.headers))),
+        Status::Partial => Ok(Status::Partial),
+    }
 }
 
-#[inline]
-fn parse_headers_iter<'a>(
-    headers: &mut &mut [Header<'a>],
-    bytes: &mut Bytes<'a>,
-    config: &HeaderParserConfig,
-) -> Result<usize> {
-    parse_headers_iter_uninit(
-        /* SAFETY: see `parse_headers_iter_uninit` guarantees */
-        unsafe { deinit_slice_mut(headers) },
-        bytes,
-        config,
-    )
-}
-
-unsafe fn deinit_slice_mut<'a, 'b, T>(s: &'a mut &'b mut [T]) -> &'a mut &'b mut [MaybeUninit<T>] {
-    let s: *mut &mut [T] = s;
-    let s = s as *mut &mut [MaybeUninit<T>];
-    &mut *s
-}
 unsafe fn assume_init_slice<T>(s: &mut [MaybeUninit<T>]) -> &mut [T] {
     let s: *mut [MaybeUninit<T>] = s;
     let s = s as *mut [T];
     &mut *s
 }
 
+/// Header parser configuration.
 #[derive(Clone, Debug, Default)]
-struct HeaderParserConfig {
+pub struct HeaderParserConfig {
     allow_spaces_after_header_name: bool,
     allow_obsolete_multiline_headers: bool,
     allow_space_before_first_header_name: bool,
     ignore_invalid_headers: bool,
+}
+
+impl HeaderParserConfig {
+    /// Sets whether spaces and tabs should be allowed after header names.
+    pub fn allow_spaces_after_header_name(
+        &mut self,
+        value: bool,
+    ) -> &mut Self {
+        self.allow_spaces_after_header_name = value;
+        self
+    }
+
+    /// Whether spaces and tabs should be allowed after header names.
+    pub fn spaces_after_header_name_are_allowed(&self) -> bool {
+        self.allow_spaces_after_header_name
+    }
+
+    /// Sets whether obsolete multiline headers should be allowed.
+    ///
+    /// This is an obsolete part of HTTP/1. Use at your own risk. If you are
+    /// building an HTTP library, the newlines (`\r` and `\n`) should be
+    /// replaced by spaces before handing the header value to the user.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// let buf = b"Folded-Header: hello\r\n there \r\n\r\n";
+    /// let mut headers = [httparse::EMPTY_HEADER; 16];
+    /// let mut headers = httparse::Headers::new(&mut headers);
+    ///
+    /// let res = httparse::HeaderParserConfig::default()
+    ///     .allow_obsolete_multiline_headers(true)
+    ///     .parse(&mut headers, buf);
+    ///
+    /// assert_eq!(res, Ok(httparse::Status::Complete(buf.len())));
+    ///
+    /// assert_eq!(headers.headers.len(), 1);
+    /// assert_eq!(headers.headers[0].name, "Folded-Header");
+    /// assert_eq!(headers.headers[0].value, b"hello\r\n there");
+    /// ```
+    pub fn allow_obsolete_multiline_headers(
+        &mut self,
+        value: bool,
+    ) -> &mut Self {
+        self.allow_obsolete_multiline_headers = value;
+        self
+    }
+
+    /// Whether obsolete multiline headers should be allowed.
+    pub fn obsolete_multiline_headers_are_allowed(&self) -> bool {
+        self.allow_obsolete_multiline_headers
+    }
+
+    /// Sets whether white space before the first header is allowed.
+    ///
+    /// This is not allowed by spec but some browsers ignore it. So this an option for
+    /// compatibility.
+    /// See https://github.com/curl/curl/issues/11605 for reference
+    /// # Example
+    ///
+    /// ```rust
+    /// let buf = b" Space-Before-Header: hello there\r\n\r\n";
+    /// let mut headers = [httparse::EMPTY_HEADER; 1];
+    /// let mut headers = httparse::Headers::new(&mut headers[..]);
+    /// let result = httparse::HeaderParserConfig::default()
+    ///     .allow_space_before_first_header_name(true)
+    ///     .parse(&mut headers, buf);
+
+    /// assert_eq!(result, Ok(httparse::Status::Complete(buf.len())));
+    /// assert_eq!(headers.headers.len(), 1);
+    /// assert_eq!(headers.headers[0].name, "Space-Before-Header");
+    /// assert_eq!(headers.headers[0].value, &b"hello there"[..]);
+    /// ```
+    pub fn allow_space_before_first_header_name(&mut self, value: bool) -> &mut Self {
+        self.allow_space_before_first_header_name = value;
+        self
+    }
+
+    /// Whether white space before first header is allowed or not
+    pub fn space_before_first_header_name_are_allowed(&self) -> bool {
+        self.allow_space_before_first_header_name
+    }
+
+    /// Sets whether invalid header lines should be silently ignored.
+    ///
+    /// This mimicks the behaviour of major browsers. You probably don't want this.
+    /// You should only want this if you are implementing a proxy whose main
+    /// purpose is to sit in front of browsers whose users access arbitrary content
+    /// which may be malformed, and they expect everything that works without
+    /// the proxy to keep working with the proxy.
+    ///
+    /// This option will prevent `HeaderParserConfig::parse` from returning
+    /// an error encountered when parsing a header, except if the error was caused
+    /// by the character NUL (ASCII code 0), as Chrome specifically always reject
+    /// those, or if the error was caused by a lone character `\r`, as Firefox and
+    /// Chrome behave differently in that case.
+    ///
+    /// The ignorable errors are:
+    /// * empty header names;
+    /// * characters that are not allowed in header names, except for `\0` and `\r`;
+    /// * when `allow_spaces_after_header_name` is not enabled,
+    ///   spaces and tabs between the header name and the colon;
+    /// * missing colon between header name and value;
+    /// * when `allow_obsolete_multiline_headers` is not enabled,
+    ///   headers using obsolete line folding.
+    /// * characters that are not allowed in header values except for `\0` and `\r`.
+    ///
+    /// If an ignorable error is encountered, the parser tries to find the next
+    /// line in the input to resume parsing the rest of the headers. As lines
+    /// contributing to a header using obsolete line folding always start
+    /// with whitespace, those will be ignored too. An error will be emitted
+    /// nonetheless if it finds `\0` or a lone `\r` while looking for the
+    /// next line.
+    pub fn ignore_invalid_headers(
+        &mut self,
+        value: bool,
+    ) -> &mut Self {
+        self.ignore_invalid_headers = value;
+        self
+    }
+
+    /// Whether invalid header lines should be silently ignored.
+    pub fn invalid_headers_are_ignored(&self) -> bool {
+        self.ignore_invalid_headers
+    }
+
+    /// Parses headers with the given config.
+    pub fn parse<'buf>(
+        &self,
+        headers: &mut Headers<'_, 'buf>,
+        buf: &'buf [u8],
+    ) -> Result<usize> {
+        headers.parse_with_config(buf, self)
+    }
+
+    /// Parses headers with the given config and buffer
+    pub fn parse_with_uninit_headers<'headers, 'buf>(
+        &self,
+        headers: &mut Headers<'headers, 'buf>,
+        buf: &'buf [u8],
+        headers_uninit: &'headers mut [MaybeUninit<Header<'buf>>],
+    ) -> Result<usize> {
+        headers.parse_with_config_and_uninit_headers(buf, self, headers_uninit)
+    }
 }
 
 /* Function which parsers headers into uninitialized buffer.
@@ -1394,7 +1620,7 @@ pub fn parse_chunk_size(buf: &[u8])
 #[cfg(test)]
 mod tests {
     use core::mem::MaybeUninit;
-    use super::{Request, Response, Status, EMPTY_HEADER, parse_chunk_size};
+    use super::{Header, Request, Response, Status, EMPTY_HEADER, parse_chunk_size, parse_headers};
 
     const NUM_OF_HEADERS: usize = 4;
 
@@ -1545,7 +1771,6 @@ mod tests {
             assert_eq!(req.headers[1].value, b"\xe3\x81\xb2\xe3/1.0");
         }
     }
-
 
     req! {
         test_request_partial,
@@ -1790,6 +2015,117 @@ mod tests {
             assert_eq!(res.headers.len(), 1);
             assert_eq!(res.headers[0].name, "Content-type");
             assert_eq!(res.headers[0].value, b"text/html");
+        }
+    }
+
+    macro_rules! headers_complete {
+        ($name:ident, $buf:expr, |$arg:ident| $body:expr) => (
+        #[test]
+        fn $name() {
+            let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+            let (_, parsed_headers) = parse_headers($buf.as_ref(), &mut headers).unwrap().unwrap();
+            closure(parsed_headers);
+
+            fn closure($arg: &[Header]) {
+                $body
+            }
+        }
+        )
+    }
+
+    headers_complete! {
+        test_headers_simple,
+        b"Server: foo.bar\r\n\r\n",
+        |_r| {}
+    }
+
+    headers_complete! {
+        test_headers,
+        b"Host: foo.com\r\nCookie: \r\n\r\n",
+        |headers| {
+            assert_eq!(headers.len(), 2);
+            assert_eq!(headers[0].name, "Host");
+            assert_eq!(headers[0].value, b"foo.com");
+            assert_eq!(headers[1].name, "Cookie");
+            assert_eq!(headers[1].value, b"");
+        }
+    }
+
+    headers_complete! {
+        test_headers_newlines,
+        b"Server: foo.bar\n\n",
+        |_r| {}
+    }
+
+    headers_complete! {
+        test_headers_no_cr,
+        b"Content-type: text/html\n\n",
+        |headers| {
+            assert_eq!(headers.len(), 1);
+            assert_eq!(headers[0].name, "Content-type");
+            assert_eq!(headers[0].value, b"text/html");
+        }
+    }
+
+    headers_complete! {
+        test_headers_optional_whitespace,
+        b"Host: \tfoo.com\t \r\nCookie: \t \r\n\r\n",
+        |headers| {
+            assert_eq!(headers.len(), 2);
+            assert_eq!(headers[0].name, "Host");
+            assert_eq!(headers[0].value, b"foo.com");
+            assert_eq!(headers[1].name, "Cookie");
+            assert_eq!(headers[1].value, b"");
+        }
+    }
+
+    headers_complete! {
+        test_headers_max,
+        b"A: A\r\nB: B\r\nC: C\r\nD: D\r\n\r\n",
+        |headers| {
+            assert_eq!(headers.len(), NUM_OF_HEADERS);
+        }
+    }
+
+    headers_complete! {
+        test_headers_multibyte,
+        b"Host: foo.com\r\nUser-Agent: \xe3\x81\xb2\xe3/1.0\r\n\r\n",
+        |headers| {
+            assert_eq!(headers.len(), 2);
+            assert_eq!(headers[0].name, "Host");
+            assert_eq!(headers[0].value, b"foo.com");
+            assert_eq!(headers[1].name, "User-Agent");
+            assert_eq!(headers[1].value, b"\xe3\x81\xb2\xe3/1.0");
+        }
+    }
+
+    macro_rules! headers_partial {
+        ($name:ident, $buf:expr, |$arg:ident| $body:expr) => (
+        #[test]
+        fn $name() {
+            let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+            let status = parse_headers($buf.as_ref(), &mut headers).unwrap();
+            assert_eq!(status, crate::Status::Partial);
+            closure(&headers[..]);
+
+            fn closure($arg: &[Header]) {
+                $body
+            }
+        }
+        )
+    }
+
+    headers_partial! {
+        test_headers_partial_parses_headers_as_much_as_it_can,
+        b"Server: yolo\r\nContent-Length: 10\r\n",
+        |headers| {
+            // `parse_headers` doesn't return the sliced headers in a partial parse, so we have to
+            // work with the original header array, which is why the length is `NUM_OF_HEADERS`.
+            assert_eq!(headers.len(), NUM_OF_HEADERS);
+            assert_eq!(headers[0].name, "Server");
+            assert_eq!(headers[0].value, b"yolo");
+            assert_eq!(headers[1].name, "Content-Length");
+            assert_eq!(headers[1].value, b"10");
         }
     }
 
@@ -2646,5 +2982,25 @@ mod tests {
         assert_eq!(response.headers[0].value, &b"bar"[..]);
         assert_eq!(response.headers[1].name, "Baz");
         assert_eq!(response.headers[1].value, &b"quux"[..]);
+    }
+
+    #[test]
+    fn test_headers_partial_with_uninit_headers() {
+        const HEADERS: &[u8] = b"Foo: bar\r\nBaz: quux\r\n";
+
+        let mut headers_uninit = unsafe {
+            MaybeUninit::<[MaybeUninit<crate::Header<'_>>; 4]>::uninit().assume_init()
+        };
+
+        let mut headers = crate::Headers::new(&mut []);
+
+        let result = headers.parse_with_uninit_headers(HEADERS, &mut headers_uninit);
+
+        assert_eq!(result, Ok(Status::Partial));
+        assert_eq!(headers.headers.len(), 2);
+        assert_eq!(headers.headers[0].name, "Foo");
+        assert_eq!(headers.headers[0].value, &b"bar"[..]);
+        assert_eq!(headers.headers[1].name, "Baz");
+        assert_eq!(headers.headers[1].value, &b"quux"[..]);
     }
 }
